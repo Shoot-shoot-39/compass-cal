@@ -10,11 +10,18 @@
   html, body, #map { height: 100%; margin: 0; padding: 0; }
   #controls {
     position: absolute; top: 10px; left: 10px; z-index: 1000;
-    background: rgba(255,255,255,0.9); padding: 10px; border-radius: 8px;
+    background: rgba(200,220,255,0.9); /* デフォルト青系 */
+    padding: 12px; border-radius: 10px;
     box-shadow: 0 0 6px rgba(0,0,0,0.3);
-    font-size: 14px;
+    font-size: 15px; transition: background 0.5s;
   }
-  button { margin: 5px 0; width: 150px; }
+  button {
+    margin: 6px 0; width: 180px; height: 48px; font-size: 16px;
+    border: none; border-radius: 10px; cursor: pointer;
+    background: #007bff; color: #fff; font-weight: bold;
+  }
+  #resetBtn { background: #555; }
+  #info { margin-top: 5px; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -25,7 +32,7 @@
 </div>
 <div id="map"></div>
 <script>
-let map = L.map('map').setView([35.6812,139.7671], 13);
+let map = L.map('map');
 L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png', {
   attribution: '地理院地図', maxZoom: 18
 }).addTo(map);
@@ -34,9 +41,18 @@ let currentLat = null, currentLon = null;
 let currentHeading = 0, measuredHeading = null, correctionOffset = 0;
 let headingLine = null, targetMarker = null;
 let targetSelectMode = false;
-
-// 現在地マーカー
 let userMarker = L.circleMarker([0,0], {radius:6, color:'blue', fillColor:'blue', fillOpacity:0.8}).addTo(map);
+
+// 初期位置を現在地に設定
+navigator.geolocation.getCurrentPosition(pos => {
+  currentLat = pos.coords.latitude;
+  currentLon = pos.coords.longitude;
+  map.setView([currentLat, currentLon], 14);
+  userMarker.setLatLng([currentLat, currentLon]);
+}, err => {
+  console.warn('現在地取得失敗:', err);
+  map.setView([35.6812,139.7671], 13); // fallback: 東京駅
+});
 
 // 現在地追跡
 navigator.geolocation.watchPosition(pos => {
@@ -60,6 +76,7 @@ if (window.DeviceOrientationEvent) {
 
 // ターゲットロックオン
 const lockBtn = document.getElementById('lockBtn');
+const controls = document.getElementById('controls');
 lockBtn.onclick = () => {
   if (currentHeading == null) { alert('方位センサーが未取得です'); return; }
   measuredHeading = currentHeading;
@@ -75,6 +92,9 @@ map.on('click', e => {
   if (correctionOffset > 180) correctionOffset -= 360;
   if (correctionOffset < -180) correctionOffset += 360;
   document.getElementById('info').innerText = `補正角: ${correctionOffset.toFixed(1)}°`;
+
+  // ステータスバー色変更
+  controls.style.background = 'rgba(255,210,210,0.9)'; // 補正済みで赤系
 
   // ターゲットマーカー表示
   if (targetMarker) targetMarker.remove();
@@ -92,6 +112,7 @@ resetBtn.onclick = () => {
   measuredHeading = null;
   targetSelectMode = false;
   document.getElementById('info').innerText = '補正角: 0°';
+  controls.style.background = 'rgba(200,220,255,0.9)'; // 通常青系に戻す
   if (targetMarker) targetMarker.remove();
   updateLine();
 };
@@ -103,7 +124,7 @@ function updateLine() {
 
   if (headingLine) headingLine.remove();
   const color = correctionOffset === 0 ? 'blue' : 'red';
-  headingLine = L.polyline([[currentLat, currentLon], [end.lat, end.lon]], {color: color}).addTo(map);
+  headingLine = L.polyline([[currentLat, currentLon], [end.lat, end.lon]], {color: color, weight:4}).addTo(map);
 }
 
 function getBearing(lat1, lon1, lat2, lon2) {
