@@ -1,208 +1,130 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
-  <title>地理院地図 + コンパス自動補正（実測→地図クリック）</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <style>
-    html,body{height:100%;margin:0;font-family:system-ui, -apple-system, "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif}
-    #map{height:100%}
-    #ui{position:absolute;left:10px;top:10px;z-index:1200;background:rgba(255,255,255,0.95);padding:10px;border-radius:8px;min-width:220px}
-    #ui button{display:block;margin:6px 0;width:100%}
-    #info{font-size:13px;margin-top:6px}
-  </style>
+<meta charset="utf-8">
+<title>地理院地図＋コンパス補正（ターゲットロックオン対応）</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html, body, #map { height: 100%; margin: 0; padding: 0; }
+  #controls {
+    position: absolute; top: 10px; left: 10px; z-index: 1000;
+    background: rgba(255,255,255,0.9); padding: 10px; border-radius: 8px;
+    box-shadow: 0 0 6px rgba(0,0,0,0.3);
+    font-size: 14px;
+  }
+  button { margin: 5px 0; width: 150px; }
+</style>
 </head>
 <body>
-  <div id="ui">
-    <button id="permBtn">方位センサー許可</button>
-    <button id="recordBtn">① 実測: 方角を記録</button>
-    <div style="display:flex;gap:6px;margin-top:6px">
-      <button id="modeMap">地図で補正モード</button>
-      <button id="resetBtn">補正リセット</button>
-    </div>
-    <div id="info">位置: -- , 方位: --°<br>記録: なし<br>補正: なし</div>
-    <div style="margin-top:6px;font-size:12px;color:#444">操作手順：<br>1) 目印に向けて「実測: 方角を記録」を押す<br>2) 地図上でその目印をタップ（補正計算）</div>
-  </div>
-  <div id="map"></div>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script>
-  // --- 状態変数 ---
-  let map, marker, line;
-  let userLat = 35.6812, userLng = 139.7671;
-  let currentHeading = 0;            // 生のコンパス（磁北基準）
-  let declination = 0;               // 偏角（磁北→真北）
-  let measuredHeading = null;        // ①で記録した実測方位（磁北基準）
-  let correctionOffset = null;       // 補正量（度）: measured - trueBearing
-  let history = [];                  // 平滑化バッファ
-  const SMOOTH_N = 5;                // 平滑化窓
-  const DIST_KM = 100;               // 方角線の長さ（km）
+<div id="controls">
+  <button id="lockBtn">🎯 ターゲットロックオン</button><br>
+  <button id="resetBtn">🔁 補正リセット</button><br>
+  <div id="info">補正角: 0°</div>
+</div>
+<div id="map"></div>
+<script>
+let map = L.map('map').setView([35.6812,139.7671], 13);
+L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png', {
+  attribution: '地理院地図', maxZoom: 18
+}).addTo(map);
 
-  // --- 地図初期化 ---
-  map = L.map('map').setView([userLat, userLng], 10);
-  L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png', { attribution: '地理院地図' }).addTo(map);
+let currentLat = null, currentLon = null;
+let currentHeading = 0, measuredHeading = null, correctionOffset = 0;
+let headingLine = null, targetMarker = null;
+let targetSelectMode = false;
 
-  marker = L.marker([userLat, userLng]).addTo(map).bindPopup('現在地');
-  line = L.polyline([], {color:'red', weight:3}).addTo(map);
+// 現在地マーカー
+let userMarker = L.circleMarker([0,0], {radius:6, color:'blue', fillColor:'blue', fillOpacity:0.8}).addTo(map);
 
-  // --- 偏角（簡易） ---
-  function calcDeclination(lat){
-    // 日本向けの簡易近似（誤差±1°程度）
-    return 6.5 + (lat - 31) * 0.3;
-  }
+// 現在地追跡
+navigator.geolocation.watchPosition(pos => {
+  currentLat = pos.coords.latitude;
+  currentLon = pos.coords.longitude;
+  userMarker.setLatLng([currentLat, currentLon]);
+  updateLine();
+}, err => {
+  console.warn('位置情報取得に失敗しました:', err);
+}, { enableHighAccuracy: true, maximumAge: 1000 });
 
-  // --- 現在地をwatchPositionで追跡 ---
-  if(navigator.geolocation){
-    navigator.geolocation.watchPosition(pos=>{
-      userLat = pos.coords.latitude;
-      userLng = pos.coords.longitude;
-      declination = calcDeclination(userLat);
-      marker.setLatLng([userLat, userLng]);
-      if(!map._userTwiceCentered){ map.setView([userLat, userLng], 12); map._userTwiceCentered = true; }
+// コンパス読み込み
+if (window.DeviceOrientationEvent) {
+  window.addEventListener('deviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation', e => {
+    if (e.absolute || e.webkitCompassHeading !== undefined) {
+      currentHeading = e.webkitCompassHeading || 360 - e.alpha;
       updateLine();
-      updateInfo();
-    }, err=>{ console.warn('位置取得エラー',err); }, { enableHighAccuracy:true, maximumAge:0, timeout:10000 });
-  } else alert('このブラウザは位置情報に対応していません');
-
-  // --- 補正算出に使う方位計算（真方位） ---
-  function getBearing(lat1, lon1, lat2, lon2){
-    const φ1 = lat1 * Math.PI/180;
-    const φ2 = lat2 * Math.PI/180;
-    const Δλ = (lon2 - lon1) * Math.PI/180;
-    const y = Math.sin(Δλ) * Math.cos(φ2);
-    const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
-    const θ = Math.atan2(y,x);
-    return (θ * 180/Math.PI + 360) % 360;
-  }
-
-  // --- 方角線を描画（真北基準で引く：declinationを適用） ---
-  function updateLine(){
-    // currentHeading（磁北基準）に補正をかけて真方位（地図の北向き）を得る
-    if(currentHeading == null) return;
-    let corrected = currentHeading; // 磁気→真北は declination
-    // 補正オフセット（ユーザ測定による）は measuredHeading - trueBearing
-    if(correctionOffset !== null) corrected = currentHeading - correctionOffset; // remove sensor bias
-    // add declination to convert magnetic heading -> true heading
-    const trueHeading = (corrected + declination + 360) % 360;
-
-    // 球面計算で目的点を求める
-    const R = 6371; // km
-    const lat1 = userLat * Math.PI/180;
-    const lon1 = userLng * Math.PI/180;
-    const brng = trueHeading * Math.PI/180;
-    const d = DIST_KM;
-
-    const lat2 = Math.asin(Math.sin(lat1)*Math.cos(d/R) + Math.cos(lat1)*Math.sin(d/R)*Math.cos(brng));
-    const lon2 = lon1 + Math.atan2(Math.sin(brng)*Math.sin(d/R)*Math.cos(lat1), Math.cos(d/R)-Math.sin(lat1)*Math.sin(lat2));
-
-    const lat2deg = lat2 * 180/Math.PI;
-    const lon2deg = lon2 * 180/Math.PI;
-
-    line.setLatLngs([[userLat,userLng],[lat2deg,lon2deg]]);
-  }
-
-  // --- 平滑化付きでコンパス値を取り扱う ---
-  function pushHeading(h){
-    if(h == null || isNaN(h)) return;
-    history.push(h);
-    if(history.length > SMOOTH_N) history.shift();
-    // 注意：角度平均はラジアンでベクトル平均する
-    let sx=0, sy=0;
-    for(const v of history){ const r=v*Math.PI/180; sx+=Math.cos(r); sy+=Math.sin(r); }
-    const avg = Math.atan2(sy, sx) * 180/Math.PI;
-    currentHeading = (avg + 360) % 360;
-    updateLine();
-    updateInfo();
-  }
-
-  // --- UI: 情報表示 ---
-  function updateInfo(){
-    const info = document.getElementById('info');
-    const posText = `位置: ${userLat.toFixed(5)}, ${userLng.toFixed(5)}`;
-    const headingText = `方位(磁): ${currentHeading!=null?currentHeading.toFixed(1):'--'}°`;
-    const measuredText = measuredHeading!=null?`記録: ${measuredHeading.toFixed(1)}°`:'記録: なし';
-    const corrText = correctionOffset!=null?`補正: ${correctionOffset.toFixed(1)}°`:'補正: なし';
-    info.innerHTML = `${posText}<br>${headingText}<br>${measuredText}<br>${corrText}`;
-  }
-
-  // --- センサー許可 & コンパス開始 ---
-  document.getElementById('permBtn').addEventListener('click', async ()=>{
-    if(typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
-      try{
-        const r = await DeviceOrientationEvent.requestPermission();
-        if(r !== 'granted') { alert('センサー許可が得られませんでした'); return; }
-      }catch(e){ console.warn(e); alert('センサー許可に失敗しました'); return; }
     }
-    startCompass();
   });
+}
 
-  function startCompass(){
-    window.addEventListener('deviceorientationabsolute', (ev)=>{
-      const h = ev.webkitCompassHeading ?? (ev.alpha!=null ? (360 - ev.alpha) : null);
-      pushHeading(h);
-    }, true);
-    window.addEventListener('deviceorientation', (ev)=>{
-      const h = ev.webkitCompassHeading ?? (ev.alpha!=null ? (360 - ev.alpha) : null);
-      pushHeading(h);
-    }, true);
-  }
+// ターゲットロックオン
+const lockBtn = document.getElementById('lockBtn');
+lockBtn.onclick = () => {
+  if (currentHeading == null) { alert('方位センサーが未取得です'); return; }
+  measuredHeading = currentHeading;
+  alert(`ターゲットロックオン！ (${measuredHeading.toFixed(1)}°)\n地図上で目標をタップしてください。`);
+  targetSelectMode = true;
+};
 
-  // --- 実測記録ボタン ---
-  document.getElementById('recordBtn').addEventListener('click', ()=>{
-    if(currentHeading == null){ alert('まずコンパスの値を取得してください（センサー許可）'); return; }
-    measuredHeading = currentHeading;
-    // store to localStorage as "lastMeasured"
-    try{ localStorage.setItem('lastMeasured', measuredHeading); }catch(e){}
-    updateInfo();
-    alert(`実測方角を記録しました: ${measuredHeading.toFixed(1)}°\n次に地図上で目印をタップしてください`);
-  });
+// 地図クリックで補正
+map.on('click', e => {
+  if (!targetSelectMode || measuredHeading == null || currentLat == null) return;
+  const bearing = getBearing(currentLat, currentLon, e.latlng.lat, e.latlng.lng);
+  correctionOffset = measuredHeading - bearing;
+  if (correctionOffset > 180) correctionOffset -= 360;
+  if (correctionOffset < -180) correctionOffset += 360;
+  document.getElementById('info').innerText = `補正角: ${correctionOffset.toFixed(1)}°`;
 
-  // --- 地図クリックで目標を取得して補正算出 ---
-  let mapMode = 'normal';
-  document.getElementById('modeMap').addEventListener('click', ()=>{
-    mapMode = (mapMode === 'normal') ? 'calibrate' : 'normal';
-    document.getElementById('modeMap').innerText = mapMode === 'calibrate' ? '地図: 補正モード(ON)' : '地図で補正モード';
-  });
+  // ターゲットマーカー表示
+  if (targetMarker) targetMarker.remove();
+  targetMarker = L.marker([e.latlng.lat, e.latlng.lng], {title: 'ターゲット'}).addTo(map);
 
-  map.on('click', function(e){
-    if(mapMode !== 'calibrate'){ return; }
-    if(measuredHeading == null){ alert('先に「実測: 方角を記録」を押してください'); return; }
-    const targetLat = e.latlng.lat;
-    const targetLon = e.latlng.lng;
-    const trueBearing = getBearing(userLat, userLng, targetLat, targetLon);
-    // measuredHeading は磁気基準、trueBearing は地図（真北基準）
-    // offset = measured(magnetic) - true(true)
-    let offset = measuredHeading - trueBearing;
-    // 正規化 -180..180
-    if(offset > 180) offset -= 360;
-    if(offset < -180) offset += 360;
-    correctionOffset = offset;
-    try{ localStorage.setItem('correctionOffset', correctionOffset); }catch(e){}
-    mapMode = 'normal';
-    document.getElementById('modeMap').innerText = '地図で補正モード';
-    updateInfo();
-    alert(`補正角を計算しました: ${correctionOffset.toFixed(1)}°\n以後の方角は自動補正されます`);
-  });
+  alert(`補正角を計算しました: ${correctionOffset.toFixed(1)}°`);
+  targetSelectMode = false;
+  updateLine();
+});
 
-  // --- 補正リセット ---
-  document.getElementById('resetBtn').addEventListener('click', ()=>{
-    measuredHeading = null; correctionOffset = null; try{ localStorage.removeItem('correctionOffset'); localStorage.removeItem('lastMeasured'); }catch(e){}
-    updateInfo();
-    alert('補正をリセットしました');
-  });
+// リセット
+const resetBtn = document.getElementById('resetBtn');
+resetBtn.onclick = () => {
+  correctionOffset = 0;
+  measuredHeading = null;
+  targetSelectMode = false;
+  document.getElementById('info').innerText = '補正角: 0°';
+  if (targetMarker) targetMarker.remove();
+  updateLine();
+};
 
-  // --- 起動時に保存パラメータを復元 ---
-  try{
-    const stored = localStorage.getItem('correctionOffset');
-    if(stored !== null) correctionOffset = parseFloat(stored);
-    const lm = localStorage.getItem('lastMeasured');
-    if(lm !== null) measuredHeading = parseFloat(lm);
-  }catch(e){ }
+function updateLine() {
+  if (currentLat == null || currentLon == null) return;
+  let corrected = currentHeading - correctionOffset;
+  const end = computeDestinationPoint(currentLat, currentLon, corrected, 100000); // 100km
 
-  updateInfo();
+  if (headingLine) headingLine.remove();
+  const color = correctionOffset === 0 ? 'blue' : 'red';
+  headingLine = L.polyline([[currentLat, currentLon], [end.lat, end.lon]], {color: color}).addTo(map);
+}
 
-  // --- ページ離脱時の注意 ---
-  window.addEventListener('beforeunload', ()=>{ /* nothing special */ });
-  </script>
+function getBearing(lat1, lon1, lat2, lon2) {
+  const φ1 = lat1 * Math.PI / 180, φ2 = lat2 * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+  const θ = Math.atan2(y, x);
+  return (θ * 180 / Math.PI + 360) % 360;
+}
+
+function computeDestinationPoint(lat, lon, bearing, distance) {
+  const R = 6371000;
+  const δ = distance / R;
+  const θ = bearing * Math.PI / 180;
+  const φ1 = lat * Math.PI / 180;
+  const λ1 = lon * Math.PI / 180;
+  const φ2 = Math.asin(Math.sin(φ1)*Math.cos(δ) + Math.cos(φ1)*Math.sin(δ)*Math.cos(θ));
+  const λ2 = λ1 + Math.atan2(Math.sin(θ)*Math.sin(δ)*Math.cos(φ1), Math.cos(δ)-Math.sin(φ1)*Math.sin(φ2));
+  return { lat: φ2*180/Math.PI, lon: λ2*180/Math.PI };
+}
+</script>
 </body>
 </html>
